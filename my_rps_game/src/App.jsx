@@ -18,7 +18,12 @@ const CHOICES = {
   SCISSORS: 'scissors'
 };
 
-// --- 自定義安全內聯 SVG 圖標元件 (避免與外部 React 實例衝突) ---
+// --- 輔助函數：生成 6 位數純數字短房號 ---
+function generateSixDigitCode() {
+  return Math.floor(100000 + Math.random() * 900000).toString();
+}
+
+// --- 自定義安全內聯 SVG 圖標元件 ---
 const RefreshCw = ({ className }) => (
   <svg className={className} xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
     <path d="M21 12a9 9 0 0 0-9-9 9.75 9.75 0 0 0-6.74 2.74L3 8" />
@@ -63,7 +68,6 @@ const LogOut = ({ className }) => (
   </svg>
 );
 
-// --- 修正後的手勢元件 ---
 function HandVisual({ choice, state, size = 'md' }) {
   const emojiMap = {
     [CHOICES.ROCK]: '✊',
@@ -107,7 +111,7 @@ export default function App() {
   const [user, setUser] = useState(null);
   const [loading, setLoading] = useState(true);
   const [errorMsg, setErrorMsg] = useState('');
-  const [isPollingMode, setIsPollingMode] = useState(false); // 是否啟用了 Canvas 降級輪詢模式
+  const [isPollingMode, setIsPollingMode] = useState(false);
 
   const [room, setRoom] = useState(null);
   const [playerRole, setPlayerRole] = useState(null);
@@ -176,14 +180,13 @@ export default function App() {
     initAuth();
   }, [supabase]);
 
-  // 3. 核心：實時訂閱 + Canvas Polling 降級安全機制
+  // 3. 核心實時更新 (相容長短碼查詢)
   useEffect(() => {
     if (!supabase || !room?.id) return;
 
     let pollingInterval = null;
 
-    // 手動拉取資料的函數 (HTTP 輪詢)
-    const fetchRoomDataData = async () => {
+    const fetchRoomData = async () => {
       const { data, error } = await supabase
         .from('games')
         .select()
@@ -194,7 +197,6 @@ export default function App() {
       }
     };
 
-    // 嘗試建立 WebSocket Realtime
     const channel = supabase
       .channel(`room:${room.id}`)
       .on('postgres_changes', {
@@ -207,12 +209,10 @@ export default function App() {
       });
 
     channel.subscribe((status, err) => {
-      // 如果 WebSocket 被 Canvas 擋掉，status 會變成 CHANNEL_ERROR
       if (status === 'CHANNEL_ERROR' || (err && err.message?.includes('WebSocket'))) {
         if (!isPollingMode) {
           setIsPollingMode(true);
-          // 每 1.5 秒自動拉取一次，模擬實時對戰
-          pollingInterval = setInterval(fetchRoomDataData, 1500);
+          pollingInterval = setInterval(fetchRoomData, 1500);
         }
       }
     });
@@ -223,9 +223,9 @@ export default function App() {
     };
   }, [supabase, room?.id, isPollingMode]);
 
-  // 4. 狀態機解析引擎
+  // 4. 狀態解析引擎 + 結束時自動更新 status = 'finished'
   useEffect(() => {
-    if (!room || !user) return;
+    if (!room || !user || !supabase) return;
 
     const role = user.id === room.p1_id ? 'p1' : 'p2';
     setPlayerRole(role);
@@ -247,8 +247,19 @@ export default function App() {
     } else if (myChoice && oppChoice) {
       calculateWinner(myChoice, oppChoice);
       setRoom(prev => prev ? { ...prev, localState: GAME_STATES.GAME_OVER } : null);
+
+      // 當遊戲分出勝負，且當前房間狀態還是 playing 時，自動更新資料庫狀態為 'finished' 釋放短碼
+      if (room.status === 'playing') {
+        supabase
+          .from('games')
+          .update({ status: 'finished' })
+          .eq('id', room.id)
+          .then(({ error }) => {
+            if (error) console.error("更新遊戲結束狀態失敗:", error.message);
+          });
+      }
     }
-  }, [room?.p1_choice, room?.p2_choice, room?.p2_id, user?.id]);
+  }, [room?.p1_choice, room?.p2_choice, room?.p2_id, room?.status, user?.id, supabase]);
 
   const calculateWinner = (my, opp) => {
     if (my === opp) { setMatchResult('draw'); return; }
@@ -256,43 +267,75 @@ export default function App() {
     setMatchResult(winConditions[my] === opp ? 'win' : 'lose');
   };
 
+  // 【優化】點擊建房：在前端生成隨機 6 位數短碼並寫入 room_code
   const createGame = async () => {
     if (!supabase || !user) return;
     setLoading(true);
+    setErrorMsg('');
+
+    const shortCode = generateSixDigitCode();
+
     const { data, error } = await supabase
       .from('games')
-      .insert([{ p1_id: user.id, status: 'waiting', p1_choice: null, p2_choice: null, p2_id: null }])
+      .insert([{ 
+        p1_id: user.id, 
+        status: 'waiting', 
+        p1_choice: null, 
+        p2_choice: null, 
+        p2_id: null,
+        room_code: shortCode // 儲存 6 位數短房號
+      }])
       .select()
       .single();
 
-    if (error) { setErrorMsg(`建房失敗: ${error.message}`); setLoading(false); }
-    else if (data) { setRoom(data); setLoading(false); }
+    if (error) { 
+      setErrorMsg(`建房失敗: ${error.message}`); 
+      setLoading(false); 
+    } else if (data) { 
+      setRoom(data); 
+      setLoading(false); 
+    }
   };
 
+  // 【優化】進房邏輯：同時比對 6 位數 room_code 並且房間狀態必須為 'waiting'
   const joinGame = async (e) => {
     e.preventDefault();
-    if (!supabase || !user || !targetRoomId.trim()) return;
+    const inputCode = targetRoomId.trim();
+    if (!supabase || !user || !inputCode) return;
     setLoading(true);
+    setErrorMsg('');
 
+    // 多重條件查詢：room_code 等於輸入值，且 status 必須是 'waiting'
     const { data: targetRoom, error: fetchError } = await supabase
       .from('games')
       .select()
-      .eq('id', targetRoomId.trim())
-      .single();
+      .eq('room_code', inputCode)
+      .eq('status', 'waiting')
+      .maybeSingle(); // 避免多筆符合時崩潰，也更好處理無房間的情況
 
-    if (fetchError || !targetRoom) { setErrorMsg("找不到該房號。"); setLoading(false); return; }
-    if (targetRoom.p1_id === user.id) { setErrorMsg("不能加入自己創的房。"); setLoading(false); return; }
-    if (targetRoom.p2_id && targetRoom.p2_id !== user.id) { setErrorMsg("房間已滿。"); setLoading(false); return; }
+    if (fetchError || !targetRoom) { 
+      setErrorMsg("找不到該有效空房，請確認 6 位數房號是否正確，或房間是否已滿。"); 
+      setLoading(false); 
+      return; 
+    }
+    if (targetRoom.p1_id === user.id) { 
+      setErrorMsg("不能加入自己創的房。"); 
+      setLoading(false); 
+      return; 
+    }
 
     const { data: updatedRoom, error: updateError } = await supabase
       .from('games')
       .update({ p2_id: user.id, status: 'playing' })
-      .eq('id', targetRoomId.trim())
+      .eq('id', targetRoom.id) // 用背後的 UUID 做精確更新
       .select()
       .single();
 
-    if (updateError) setErrorMsg(`加入失敗: ${updateError.message}`);
-    else if (updatedRoom) setRoom(updatedRoom);
+    if (updateError) {
+      setErrorMsg(`加入失敗: ${updateError.message}`);
+    } else if (updatedRoom) { 
+      setRoom(updatedRoom); 
+    }
     setLoading(false);
   };
 
@@ -302,9 +345,13 @@ export default function App() {
     await supabase.from('games').update(updateField).eq('id', room.id);
   };
 
-  const handlePlayAgain = async () => {
-    if (!supabase || !room) return;
-    await supabase.from('games').update({ p1_choice: null, p2_choice: null, status: 'playing' }).eq('id', room.id);
+  // 【優化】因為上一局在判定輸贏時 status 已經變成 'finished'
+  // 為了安全釋放短碼，點擊「再玩一局」會將玩家帶回主大廳，以便快速建立下一場全新短碼的戰局
+  const handlePlayAgain = () => {
+    setRoom(null);
+    setLocalChoice(null);
+    setMatchResult(null);
+    setTargetRoomId('');
   };
 
   if (loading) {
@@ -325,7 +372,7 @@ export default function App() {
           <div className="absolute top-0 left-0 w-full h-1 bg-gradient-to-r from-blue-500 to-purple-500"></div>
           <div className="text-center mb-8">
             <h1 className="text-3xl font-black text-transparent bg-clip-text bg-gradient-to-r from-blue-400 to-purple-500 mb-2">P2P RPS Clash</h1>
-            <p className="text-slate-400 text-sm">Supabase 兼容版戰場</p>
+            <p className="text-slate-400 text-sm">極速 6 位數短碼房版</p>
           </div>
 
           {errorMsg && <div className="p-3 mb-6 bg-rose-950/40 border border-rose-900/50 rounded-xl text-xs text-rose-400 text-center">{errorMsg}</div>}
@@ -337,8 +384,8 @@ export default function App() {
             </div>
             <div className="relative"><div className="absolute inset-0 flex items-center"><div className="w-full border-t border-slate-800"></div></div><div className="relative flex justify-center text-xs"><span className="px-2 bg-slate-900 text-slate-500">或</span></div></div>
             <form onSubmit={joinGame} className="space-y-3">
-              <input type="text" placeholder="輸入房號加入..." value={targetRoomId} onChange={(e) => setTargetRoomId(e.target.value)} className="w-full bg-slate-950 border border-slate-800 text-slate-200 rounded-xl px-4 py-2 text-sm font-mono outline-none" />
-              <button type="submit" disabled={!targetRoomId.trim()} className="w-full bg-purple-600 hover:bg-purple-700 text-white py-2 rounded-xl font-semibold transition-all">加入戰局</button>
+              <input type="text" maxLength={6} placeholder="輸入 6 位數房號..." value={targetRoomId} onChange={(e) => setTargetRoomId(e.target.value.replace(/\D/g, ''))} className="w-full bg-slate-950 border border-slate-800 text-slate-200 rounded-xl px-4 py-2 text-sm font-mono text-center tracking-[0.2em] outline-none placeholder:tracking-normal" />
+              <button type="submit" disabled={targetRoomId.trim().length !== 6} className="w-full bg-purple-600 hover:bg-purple-700 text-white py-2 rounded-xl font-semibold transition-all disabled:opacity-50 disabled:hover:bg-purple-600">加入戰局</button>
             </form>
           </div>
         </div>
@@ -368,7 +415,7 @@ export default function App() {
             </>
           )}
         </div>
-        <button onClick={() => setRoom(null)} className="text-xs text-slate-400 hover:text-rose-400 flex items-center gap-1"><LogOut className="w-3.5 h-3.5" />離開</button>
+        <button onClick={() => setRoom(null)} className="text-xs text-slate-400 hover:text-rose-400 flex items-center gap-1"><LogOut className="w-3.5 h-3.5" />離開房間</button>
       </header>
 
       <main className="flex-1 flex flex-col max-w-4xl mx-auto w-full p-6">
@@ -376,7 +423,7 @@ export default function App() {
           <h2 className="text-xs font-bold text-slate-500 uppercase tracking-widest">對手</h2>
           <HandVisual choice={oppChoice} state={currentLocalState === GAME_STATES.GAME_OVER ? 'revealed' : (oppChoice ? 'ready' : 'thinking')} />
           <div className="h-6 text-sm">
-            {!oppId && <span className="text-amber-400 animate-pulse">等待對手輸入房號加入...</span>}
+            {!oppId && <span className="text-amber-400 animate-pulse">等待對手輸入 6 位數短碼加入...</span>}
             {oppId && !oppChoice && currentLocalState !== GAME_STATES.GAME_OVER && <span className="text-slate-500">對方考慮中...</span>}
             {oppId && oppChoice && currentLocalState !== GAME_STATES.GAME_OVER && <span className="text-emerald-400 font-bold">對方已就緒 ✅</span>}
           </div>
@@ -391,13 +438,14 @@ export default function App() {
         <div className="flex-1 flex flex-col items-center justify-center space-y-6">
           {currentLocalState === GAME_STATES.WAITING_FOR_PLAYER2 ? (
             <div className="bg-slate-900 border border-slate-800 p-6 rounded-2xl max-w-sm w-full text-center space-y-3">
-              <p className="text-xs font-bold text-slate-400 uppercase tracking-widest">你的房號 (複製給朋友)</p>
-              <div className="flex items-center bg-slate-950 p-2.5 rounded-xl border border-slate-800 font-mono text-xs text-blue-400">
-                <span className="flex-1 truncate select-all">{room.id}</span>
-                <button onClick={() => { navigator.clipboard.writeText(room.id); setCopied(true); setTimeout(() => setCopied(false), 2000); }} className="ml-2 p-1 bg-slate-800 rounded">
-                  {copied ? <Check className="w-3.5 h-3.5 text-emerald-500" /> : <Copy className="w-3.5 h-3.5" />}
+              <p className="text-xs font-bold text-slate-400 uppercase tracking-widest">你的遊戲短房號 (複製給朋友)</p>
+              <div className="flex items-center justify-center bg-slate-950 p-3 rounded-xl border border-slate-800 font-mono text-2xl font-bold tracking-[0.25em] text-blue-400 pl-[0.55em]">
+                <span>{room.room_code}</span>
+                <button onClick={() => { navigator.clipboard.writeText(room.room_code); setCopied(true); setTimeout(() => setCopied(false), 2000); }} className="ml-4 p-1.5 bg-slate-800 rounded-lg text-sm tracking-normal">
+                  {copied ? <Check className="w-4 h-4 text-emerald-500" /> : <Copy className="w-4 h-4 text-slate-300" />}
                 </button>
               </div>
+              <p className="text-[10px] text-slate-500">背後 UUID：{room.id}</p>
             </div>
           ) : (
             <>
@@ -412,7 +460,7 @@ export default function App() {
                   );
                 })}
               </div>
-              <h2 className="text-xs font-bold text-blue-500 uppercase tracking-widest">我方</h2>
+              <h2 className="text-xs font-bold text-blue-500 uppercase tracking-widest">我方 (房號: {room.room_code})</h2>
             </>
           )}
         </div>
@@ -421,12 +469,12 @@ export default function App() {
       {currentLocalState === GAME_STATES.GAME_OVER && (
         <div className="fixed inset-0 bg-slate-950/80 backdrop-blur-sm flex items-center justify-center p-4">
           <div className="bg-slate-900 border border-slate-800 rounded-3xl p-8 max-w-sm w-full text-center shadow-2xl">
-            <h1 className="text-3xl font-black mb-6">
+            <h1 className="text-3xl font-black mb-6 animate-bounce">
               {matchResult === 'win' && '🎉 你贏了！'}
               {matchResult === 'lose' && '💀 你輸了'}
               {matchResult === 'draw' && '🤝 平手'}
             </h1>
-            <button onClick={handlePlayAgain} className="w-full py-3 bg-gradient-to-r from-blue-500 to-purple-600 rounded-xl font-bold">再玩一局</button>
+            <button onClick={handlePlayAgain} className="w-full py-3 bg-gradient-to-r from-blue-500 to-purple-600 rounded-xl font-bold text-white shadow-lg hover:from-blue-600 hover:to-purple-700 transition-all">返回大廳重新挑戰</button>
           </div>
         </div>
       )}
