@@ -113,10 +113,8 @@ export default function App() {
   const [errorMsg, setErrorMsg] = useState('');
   const [isPollingMode, setIsPollingMode] = useState(false);
 
+  // 只保留房間核心狀態，其餘狀態均透過資料庫實時推算，徹底消除 Bug！
   const [room, setRoom] = useState(null);
-  const [playerRole, setPlayerRole] = useState(null);
-  const [localChoice, setLocalChoice] = useState(null);
-  const [matchResult, setMatchResult] = useState(null);
   const [copied, setCopied] = useState(false);
   const [targetRoomId, setTargetRoomId] = useState('');
 
@@ -180,7 +178,7 @@ export default function App() {
     initAuth();
   }, [supabase]);
 
-  // 3. 核心實時更新 (相容長短碼查詢)
+  // 3. 核心實時更新機制 (相容長短碼查詢與 Canvas 降級)
   useEffect(() => {
     if (!supabase || !room?.id) return;
 
@@ -192,9 +190,7 @@ export default function App() {
         .select()
         .eq('id', roomRef.current?.id)
         .single();
-      if (data) {
-        setRoom(data);
-      }
+      if (data) setRoom(data);
     };
 
     const channel = supabase
@@ -223,51 +219,41 @@ export default function App() {
     };
   }, [supabase, room?.id, isPollingMode]);
 
-  // 4. 狀態解析引擎 + 結束時自動更新 status = 'finished'
-  useEffect(() => {
-    if (!room || !user || !supabase) return;
 
-    const role = user.id === room.p1_id ? 'p1' : 'p2';
-    setPlayerRole(role);
+  // 4. 【純粹衍生狀態引擎】：100% 根據資料庫算出現有狀態，杜絕任何畫面不同步 Bug！
+  const isP1 = user?.id === room?.p1_id;
+  const myChoice = isP1 ? room?.p1_choice : room?.p2_choice;
+  const oppChoice = isP1 ? room?.p2_choice : room?.p1_choice;
+  const oppId = isP1 ? room?.p2_id : room?.p1_id;
 
-    const myChoice = role === 'p1' ? room.p1_choice : room.p2_choice;
-    const oppChoice = role === 'p1' ? room.p2_choice : room.p1_choice;
-    const oppId = role === 'p1' ? room.p2_id : room.p1_id;
+  let currentLocalState = GAME_STATES.LOBBY;
+  let matchResult = null;
 
-    setLocalChoice(myChoice);
-
+  if (room) {
     if (!oppId) {
-      setRoom(prev => prev ? { ...prev, localState: GAME_STATES.WAITING_FOR_PLAYER2 } : null);
+      currentLocalState = GAME_STATES.WAITING_FOR_PLAYER2;
     } else if (!myChoice && !oppChoice) {
-      setRoom(prev => prev ? { ...prev, localState: GAME_STATES.PICKING } : null);
+      currentLocalState = GAME_STATES.PICKING;
     } else if (myChoice && !oppChoice) {
-      setRoom(prev => prev ? { ...prev, localState: GAME_STATES.WAITING_FOR_OPPONENT } : null);
+      currentLocalState = GAME_STATES.WAITING_FOR_OPPONENT;
     } else if (!myChoice && oppChoice) {
-      setRoom(prev => prev ? { ...prev, localState: GAME_STATES.PICKING } : null);
+      currentLocalState = GAME_STATES.PICKING;
     } else if (myChoice && oppChoice) {
-      calculateWinner(myChoice, oppChoice);
-      setRoom(prev => prev ? { ...prev, localState: GAME_STATES.GAME_OVER } : null);
-
-      // 當遊戲分出勝負，且當前房間狀態還是 playing 時，自動更新資料庫狀態為 'finished' 釋放短碼
-      if (room.status === 'playing') {
-        supabase
-          .from('games')
-          .update({ status: 'finished' })
-          .eq('id', room.id)
-          .then(({ error }) => {
-            if (error) console.error("更新遊戲結束狀態失敗:", error.message);
-          });
+      currentLocalState = GAME_STATES.GAME_OVER;
+      
+      // 計算勝負
+      if (myChoice === oppChoice) {
+        matchResult = 'draw';
+      } else {
+        const winConditions = { [CHOICES.ROCK]: CHOICES.SCISSORS, [CHOICES.PAPER]: CHOICES.ROCK, [CHOICES.SCISSORS]: CHOICES.PAPER };
+        matchResult = winConditions[myChoice] === oppChoice ? 'win' : 'lose';
       }
     }
-  }, [room?.p1_choice, room?.p2_choice, room?.p2_id, room?.status, user?.id, supabase]);
+  }
 
-  const calculateWinner = (my, opp) => {
-    if (my === opp) { setMatchResult('draw'); return; }
-    const winConditions = { [CHOICES.ROCK]: CHOICES.SCISSORS, [CHOICES.PAPER]: CHOICES.ROCK, [CHOICES.SCISSORS]: CHOICES.PAPER };
-    setMatchResult(winConditions[my] === opp ? 'win' : 'lose');
-  };
 
-  // 【優化】點擊建房：在前端生成隨機 6 位數短碼並寫入 room_code
+  // --- 遊戲互動指令 ---
+
   const createGame = async () => {
     if (!supabase || !user) return;
     setLoading(true);
@@ -290,14 +276,12 @@ export default function App() {
 
     if (error) { 
       setErrorMsg(`建房失敗: ${error.message}`); 
-      setLoading(false); 
     } else if (data) { 
       setRoom(data); 
-      setLoading(false); 
     }
+    setLoading(false); 
   };
 
-  // 【優化】進房邏輯：同時比對 6 位數 room_code 並且房間狀態必須為 'waiting'
   const joinGame = async (e) => {
     e.preventDefault();
     const inputCode = targetRoomId.trim();
@@ -311,10 +295,10 @@ export default function App() {
       .select()
       .eq('room_code', inputCode)
       .eq('status', 'waiting')
-      .maybeSingle(); // 避免多筆符合時崩潰，也更好處理無房間的情況
+      .maybeSingle(); 
 
     if (fetchError || !targetRoom) { 
-      setErrorMsg("找不到該有效空房，請確認 6 位數房號是否正確，或房間是否已滿。"); 
+      setErrorMsg("找不到該有效空房，請確認 6 位數房號是否正確。"); 
       setLoading(false); 
       return; 
     }
@@ -340,19 +324,36 @@ export default function App() {
   };
 
   const handlePick = async (choice) => {
-    if (!supabase || !room || !playerRole) return;
-    const updateField = playerRole === 'p1' ? { p1_choice: choice } : { p2_choice: choice };
+    // 防呆：必須在 PICKING 狀態下才能出拳，防外掛連點！
+    if (!supabase || !room || currentLocalState !== GAME_STATES.PICKING) return;
+    const updateField = isP1 ? { p1_choice: choice } : { p2_choice: choice };
     await supabase.from('games').update(updateField).eq('id', room.id);
   };
 
-  // 【優化】因為上一局在判定輸贏時 status 已經變成 'finished'
-  // 為了安全釋放短碼，點擊「再玩一局」會將玩家帶回主大廳，以便快速建立下一場全新短碼的戰局
-  const handlePlayAgain = () => {
-    setRoom(null);
-    setLocalChoice(null);
-    setMatchResult(null);
-    setTargetRoomId('');
+  // 【優化重玩機制】直接清空出拳資料並將房間保持為 playing，兩人即可瞬間進入下一局對決！
+  const handlePlayAgain = async () => {
+    if (!supabase || !room) return;
+    setLoading(true);
+    await supabase.from('games').update({ 
+      p1_choice: null, 
+      p2_choice: null, 
+      status: 'playing' 
+    }).eq('id', room.id);
+    setLoading(false);
   };
+
+  // 離開房間：將房間狀態改為 finished 徹底釋放並銷毀，帶回大廳
+  const leaveRoom = async () => {
+    if (supabase && room) {
+      await supabase.from('games').update({ status: 'finished' }).eq('id', room.id);
+    }
+    setRoom(null);
+    setTargetRoomId('');
+    setErrorMsg('');
+  };
+
+
+  // --- UI 渲染區 ---
 
   if (loading) {
     return (
@@ -365,6 +366,7 @@ export default function App() {
     );
   }
 
+  // 大廳畫面
   if (!room) {
     return (
       <div className="bg-slate-950 min-h-screen text-white flex flex-col items-center justify-center p-6">
@@ -393,12 +395,7 @@ export default function App() {
     );
   }
 
-  const currentLocalState = room.localState || GAME_STATES.PICKING;
-  const isP1 = playerRole === 'p1';
-  const myChoice = isP1 ? room.p1_choice : room.p2_choice;
-  const oppChoice = isP1 ? room.p2_choice : room.p1_choice;
-  const oppId = isP1 ? room.p2_id : room.p1_id;
-
+  // 戰場畫面
   return (
     <div className="flex flex-col min-h-screen bg-slate-950 text-slate-200">
       <header className="p-4 border-b border-slate-800 flex justify-between items-center bg-slate-900/50 backdrop-blur-md">
@@ -415,7 +412,7 @@ export default function App() {
             </>
           )}
         </div>
-        <button onClick={() => setRoom(null)} className="text-xs text-slate-400 hover:text-rose-400 flex items-center gap-1"><LogOut className="w-3.5 h-3.5" />離開房間</button>
+        <button onClick={leaveRoom} className="text-xs text-slate-400 hover:text-rose-400 flex items-center gap-1"><LogOut className="w-3.5 h-3.5" />離開房間</button>
       </header>
 
       <main className="flex-1 flex flex-col max-w-4xl mx-auto w-full p-6">
@@ -445,7 +442,6 @@ export default function App() {
                   {copied ? <Check className="w-4 h-4 text-emerald-500" /> : <Copy className="w-4 h-4 text-slate-300" />}
                 </button>
               </div>
-              <p className="text-[10px] text-slate-500">背後 UUID：{room.id}</p>
             </div>
           ) : (
             <>
@@ -469,12 +465,12 @@ export default function App() {
       {currentLocalState === GAME_STATES.GAME_OVER && (
         <div className="fixed inset-0 bg-slate-950/80 backdrop-blur-sm flex items-center justify-center p-4">
           <div className="bg-slate-900 border border-slate-800 rounded-3xl p-8 max-w-sm w-full text-center shadow-2xl">
-            <h1 className="text-3xl font-black mb-6 animate-bounce">
+            <h1 className="text-4xl font-black mb-6 animate-bounce">
               {matchResult === 'win' && '🎉 你贏了！'}
               {matchResult === 'lose' && '💀 你輸了'}
               {matchResult === 'draw' && '🤝 平手'}
             </h1>
-            <button onClick={handlePlayAgain} className="w-full py-3 bg-gradient-to-r from-blue-500 to-purple-600 rounded-xl font-bold text-white shadow-lg hover:from-blue-600 hover:to-purple-700 transition-all">返回大廳重新挑戰</button>
+            <button onClick={handlePlayAgain} className="w-full py-4 bg-gradient-to-r from-blue-500 to-purple-600 rounded-xl font-bold text-white shadow-lg hover:from-blue-600 hover:to-purple-700 transition-all active:scale-95">再玩一局！</button>
           </div>
         </div>
       )}
